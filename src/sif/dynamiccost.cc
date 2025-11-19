@@ -1,22 +1,26 @@
-#include <boost/optional.hpp>
-
+#include "sif/dynamiccost.h"
 #include "baldr/graphconstants.h"
-#include "midgard/util.h"
+#include "baldr/rapidjson_utils.h"
+#include "exceptions.h"
 #include "proto_conversions.h"
 #include "sif/autocost.h"
 #include "sif/bicyclecost.h"
-#include "sif/dynamiccost.h"
+#include "sif/hierarchylimits.h"
 #include "sif/motorcyclecost.h"
 #include "sif/motorscootercost.h"
 #include "sif/nocost.h"
 #include "sif/pedestriancost.h"
 #include "sif/transitcost.h"
 #include "sif/truckcost.h"
-#include "worker.h"
+
+#include <boost/optional.hpp>
 
 using namespace valhalla::baldr;
+using namespace valhalla::midgard;
 
 namespace {
+
+constexpr double kMinCustomFactor = std::numeric_limits<double>::epsilon();
 
 uint8_t SpeedMask_Parse(const boost::optional<const rapidjson::Value&>& speed_types) {
   static const std::unordered_map<std::string, uint8_t> types{
@@ -111,6 +115,32 @@ constexpr ranged_default_t<uint32_t> kFixedSpeedRange{0, baldr::kDisableFixedSpe
                                                       baldr::kMaxSpeedKph};
 } // namespace
 
+/**
+ * When all ranges for a given edge are added, sort by range start
+ * and return the smallest factor found for this edge.
+ */
+double custom_cost_t::sort_and_find_smallest() {
+  if (ranges.empty())
+    return 1.;
+
+  std::sort(ranges.begin(), ranges.end(),
+            [](const cost_edge_t& a, const cost_edge_t& b) { return a.start < b.start; });
+
+  // keep track of how much of the edge is
+  // not covered by ranges
+  double uncovered = 1.;
+  double avg = 0.;
+  double min_factor = 1.;
+  for (const auto& range : ranges) {
+    uncovered -= range.end - range.start;
+    avg += (range.end - range.start) * range.factor;
+    min_factor = std::min(min_factor, range.factor);
+  }
+  avg += uncovered * 1.;
+  avg_factor = std::max(avg, kMinCustomFactor);
+  return std::max(min_factor, kMinCustomFactor);
+}
+
 /*
  * Assign default values for costing options in constructor. In case of different
  * default values they should be overridden in "<type>cost.cc" file.
@@ -159,7 +189,8 @@ DynamicCost::DynamicCost(const Costing& costing,
       ignore_construction_(costing.options().ignore_construction()),
       top_speed_(costing.options().top_speed()), fixed_speed_(costing.options().fixed_speed()),
       filter_closures_(ignore_closures_ ? false : costing.filter_closures()),
-      penalize_uturns_(penalize_uturns) {
+      penalize_uturns_(penalize_uturns), is_hgv_(costing.type() == Costing::truck),
+      min_linear_cost_factor_(1.) {
 
   // set user supplied hierarchy limits if present, fill the other
   // required levels up with sentinel values (clamping to config supplied limits/defaults is handled
@@ -183,6 +214,24 @@ DynamicCost::DynamicCost(const Costing& costing,
   for (auto& edge : costing.options().exclude_edges()) {
     user_exclude_edges_.insert({GraphId(edge.id()), edge.percent_along()});
   }
+
+  // add linear feature factors
+  for (auto& e : costing.options().cost_factor_edges()) {
+    // short-circuit the ones with factor 0 by putting them on the exclude pile
+    if (e.factor() == 0.) {
+      user_exclude_edges_.insert({static_cast<GraphId>(e.id()), e.start()});
+      break;
+    }
+    auto& cost_edge = linear_cost_edges_[static_cast<GraphId>(e.id())];
+    cost_edge.ranges.push_back({e.start(), e.end(), e.factor()});
+  }
+
+  // once all cost factors are filled, sort by range, precompute overall average
+  // and store the overall minimum factor so it won't mess with the A* heuristic
+  for (auto& [edge, cost_factors] : linear_cost_edges_) {
+    min_linear_cost_factor_ =
+        std::min(min_linear_cost_factor_, cost_factors.sort_and_find_smallest());
+  }
 }
 
 DynamicCost::~DynamicCost() {
@@ -199,9 +248,11 @@ bool DynamicCost::AllowMultiPass() const {
 // using them for the current route. Here we just call out to the derived classes costing function
 // with a time that tells the function that we aren't using time. This avoids having to worry about
 // default parameters and inheritance (which are a bad mix)
-Cost DynamicCost::EdgeCost(const baldr::DirectedEdge* edge, const graph_tile_ptr& tile) const {
+Cost DynamicCost::EdgeCost(const baldr::DirectedEdge* edge,
+                           const baldr::GraphId& edgeid,
+                           const graph_tile_ptr& tile) const {
   uint8_t flow_sources;
-  return EdgeCost(edge, tile, TimeInfo::invalid(), flow_sources);
+  return EdgeCost(edge, edgeid, tile, TimeInfo::invalid(), flow_sources);
 }
 
 // Returns the cost to make the transition from the predecessor edge.
@@ -321,10 +372,6 @@ bool DynamicCost::bicycle() const {
   return false;
 }
 
-bool DynamicCost::is_hgv() const {
-  return false;
-}
-
 // Add to the exclude list.
 void DynamicCost::AddToExcludeList(const graph_tile_ptr&) {
 }
@@ -407,16 +454,16 @@ void ParseBaseCostOptions(const rapidjson::Value& json,
   }
 
   // various traversability flags
-  JSON_PBF_DEFAULT(co, false, json, "/ignore_restrictions", ignore_restrictions);
-  JSON_PBF_DEFAULT(co, false, json, "/ignore_oneways", ignore_oneways);
-  JSON_PBF_DEFAULT(co, false, json, "/ignore_access", ignore_access);
-  JSON_PBF_DEFAULT(co, false, json, "/ignore_closures", ignore_closures);
+  JSON_PBF_DEFAULT_V2(co, false, json, "/ignore_restrictions", ignore_restrictions);
+  JSON_PBF_DEFAULT_V2(co, false, json, "/ignore_oneways", ignore_oneways);
+  JSON_PBF_DEFAULT_V2(co, false, json, "/ignore_access", ignore_access);
+  JSON_PBF_DEFAULT_V2(co, false, json, "/ignore_closures", ignore_closures);
   JSON_PBF_DEFAULT_V2(co, false, json, "/ignore_construction", ignore_construction);
   JSON_PBF_DEFAULT_V2(co, false, json, "/ignore_non_vehicular_restrictions",
                       ignore_non_vehicular_restrictions);
 
   // shortest
-  JSON_PBF_DEFAULT(co, false, json, "/shortest", shortest);
+  JSON_PBF_DEFAULT_V2(co, false, json, "/shortest", shortest);
 
   // disable hierarchy pruning
   co->set_disable_hierarchy_pruning(
@@ -501,7 +548,7 @@ void ParseBaseCostOptions(const rapidjson::Value& json,
     JSON_PBF_RANGED_DEFAULT(co, cfg.use_rail_ferry_, json, "/use_rail_ferry", use_rail_ferry);
   }
 
-  JSON_PBF_DEFAULT(co, cfg.exclude_unpaved_, json, "/exclude_unpaved", exclude_unpaved);
+  JSON_PBF_DEFAULT_V2(co, cfg.exclude_unpaved_, json, "/exclude_unpaved", exclude_unpaved);
 
   JSON_PBF_DEFAULT_V2(co, cfg.exclude_bridges_, json, "/exclude_bridges", exclude_bridges);
   JSON_PBF_DEFAULT_V2(co, cfg.exclude_tunnels_, json, "/exclude_tunnels", exclude_tunnels);
@@ -509,8 +556,8 @@ void ParseBaseCostOptions(const rapidjson::Value& json,
   JSON_PBF_DEFAULT_V2(co, cfg.exclude_highways_, json, "/exclude_highways", exclude_highways);
   JSON_PBF_DEFAULT_V2(co, cfg.exclude_ferries_, json, "/exclude_ferries", exclude_ferries);
 
-  JSON_PBF_DEFAULT(co, cfg.exclude_cash_only_tolls_, json, "/exclude_cash_only_tolls",
-                   exclude_cash_only_tolls);
+  JSON_PBF_DEFAULT_V2(co, cfg.exclude_cash_only_tolls_, json, "/exclude_cash_only_tolls",
+                      exclude_cash_only_tolls);
 
   // service_penalty
   JSON_PBF_RANGED_DEFAULT(co, cfg.service_penalty_, json, "/service_penalty", service_penalty);
@@ -532,9 +579,9 @@ void ParseBaseCostOptions(const rapidjson::Value& json,
   JSON_PBF_RANGED_DEFAULT(co, cfg.closure_factor_, json, "/closure_factor", closure_factor);
 
   // HOT/HOV
-  JSON_PBF_DEFAULT(co, cfg.include_hot_, json, "/include_hot", include_hot);
-  JSON_PBF_DEFAULT(co, cfg.include_hov2_, json, "/include_hov2", include_hov2);
-  JSON_PBF_DEFAULT(co, cfg.include_hov3_, json, "/include_hov3", include_hov3);
+  JSON_PBF_DEFAULT_V2(co, cfg.include_hot_, json, "/include_hot", include_hot);
+  JSON_PBF_DEFAULT_V2(co, cfg.include_hov2_, json, "/include_hov2", include_hov2);
+  JSON_PBF_DEFAULT_V2(co, cfg.include_hov3_, json, "/include_hov3", include_hov3);
 
   JSON_PBF_RANGED_DEFAULT_V2(co, kFixedSpeedRange, json, "/fixed_speed", fixed_speed);
 }

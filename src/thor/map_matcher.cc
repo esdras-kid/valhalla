@@ -1,11 +1,8 @@
-#include "midgard/logging.h"
-#include <algorithm>
-#include <vector>
-
+#include "thor/map_matcher.h"
 #include "baldr/datetime.h"
 #include "baldr/time_info.h"
-#include "thor/map_matcher.h"
-#include "thor/worker.h"
+
+#include <vector>
 
 using namespace valhalla::baldr;
 using namespace valhalla::sif;
@@ -254,8 +251,8 @@ MapMatcher::FormPath(meili::MapMatcher* matcher,
 
     uint8_t flow_sources;
     // Get time along the edge, handling partial distance along the first and last edge.
-    elapsed += costing->EdgeCost(directededge, tile, offset_time_info, flow_sources) *
-               (edge_segment.target - edge_segment.source);
+    elapsed += costing->PartialEdgeCost(directededge, edge_id, tile, offset_time_info, flow_sources,
+                                        edge_segment.source, edge_segment.target);
 
     // Use timestamps to update elapsed time. Use the timestamp at the interpolation
     // that no longer matches the edge_id (or the last interpolation if the edge id

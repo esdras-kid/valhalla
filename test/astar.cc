@@ -1,46 +1,36 @@
-#include "midgard/logging.h"
-#include "test.h"
-#include <cstdint>
-
 #include "baldr/graphid.h"
 #include "baldr/graphreader.h"
 #include "baldr/location.h"
 #include "baldr/rapidjson_utils.h"
 #include "baldr/tilehierarchy.h"
-#include "filesystem.h"
+#include "gurka.h"
 #include "loki/search.h"
 #include "loki/worker.h"
 #include "midgard/logging.h"
 #include "midgard/pointll.h"
-#include "midgard/vector2.h"
-#include "mjolnir/graphbuilder.h"
-#include "mjolnir/graphenhancer.h"
 #include "mjolnir/graphtilebuilder.h"
-#include "mjolnir/graphvalidator.h"
-#include "mjolnir/pbfgraphparser.h"
 #include "mjolnir/util.h"
-#include "odin/directionsbuilder.h"
 #include "odin/worker.h"
+#include "proto/directions.pb.h"
+#include "proto/options.pb.h"
+#include "proto/trip.pb.h"
 #include "sif/costconstants.h"
 #include "sif/dynamiccost.h"
-#include "sif/pedestriancost.h"
+#include "sif/hierarchylimits.h"
+#include "test.h"
 #include "thor/bidirectional_astar.h"
 #include "thor/pathalgorithm.h"
-#include "thor/triplegbuilder.h"
 #include "thor/unidirectional_astar.h"
 #include "thor/worker.h"
 #include "tyr/actor.h"
 #include "tyr/serializers.h"
 #include "worker.h"
 
-#include "gurka.h"
-
-#include "proto/directions.pb.h"
-#include "proto/options.pb.h"
-#include "proto/trip.pb.h"
-
 #include <boost/algorithm/string/join.hpp>
 #include <boost/property_tree/ptree.hpp>
+
+#include <cstdint>
+#include <filesystem>
 
 #if !defined(VALHALLA_SOURCE_DIR)
 #define VALHALLA_SOURCE_DIR
@@ -49,6 +39,7 @@
 namespace bpt = boost::property_tree;
 
 using namespace valhalla;
+using namespace valhalla::baldr;
 namespace vm = valhalla::midgard;
 namespace vb = valhalla::baldr;
 namespace vs = valhalla::sif;
@@ -57,9 +48,6 @@ namespace vk = valhalla::loki;
 namespace vj = valhalla::mjolnir;
 namespace vo = valhalla::odin;
 namespace vr = valhalla::tyr;
-
-#include "mjolnir/directededgebuilder.h"
-#include "mjolnir/graphtilebuilder.h"
 
 namespace {
 
@@ -80,6 +68,15 @@ const gurka::ways ways1 = {{"ab", {{"highway", "motorway"}}},
                            {"bd", {{"highway", "motorway"}}},
                            {"ac", {{"highway", "motorway"}}},
                            {"dc", {{"highway", "motorway"}}}};
+// We need to use a non-conflicting osm ID range for each map, as they
+// all get merged during tile building, and we don't want a weirdly connected
+// graph because IDs are shared, so we start at 0 here but continue at 4 in the next batch
+const gurka::nodes nodes1 = {
+    {"a", {{"osm_id", "0"}}},
+    {"b", {{"osm_id", "1"}}},
+    {"c", {{"osm_id", "2"}}},
+    {"d", {{"osm_id", "3"}}},
+};
 
 //
 // second test is a triangle set of roads, where the height of the triangle is
@@ -97,6 +94,11 @@ const std::string map2 = R"(
 const gurka::ways ways2 = {{"ef", {{"highway", "residential"}, {"foot", "yes"}}},
                            {"eg", {{"highway", "residential"}, {"foot", "yes"}}},
                            {"fg", {{"highway", "residential"}, {"foot", "yes"}}}};
+const gurka::nodes nodes2 = {
+    {"e", {{"osm_id", "4"}}},
+    {"f", {{"osm_id", "5"}}},
+    {"g", {{"osm_id", "6"}}},
+};
 
 // Third test has a complex turn restriction preventing K->H->I->L  (marked with R)
 // which should force the algorithm to take the detour via the J->M edge
@@ -119,6 +121,10 @@ const gurka::ways ways3 = {{"kh", {{"highway", "motorway"}}}, {"hi", {{"highway"
                            {"ij", {{"highway", "motorway"}}}, {"lm", {{"highway", "motorway"}}},
                            {"mj", {{"highway", "motorway"}}}, {"il", {{"highway", "motorway"}}},
                            {"nk", {{"highway", "motorway"}}}};
+const gurka::nodes nodes3 = {{"h", {{"osm_id", "7"}}},  {"i", {{"osm_id", "8"}}},
+                             {"j", {{"osm_id", "9"}}},  {"k", {{"osm_id", "10"}}},
+                             {"l", {{"osm_id", "11"}}}, {"m", {{"osm_id", "12"}}},
+                             {"n", {{"osm_id", "13"}}}};
 
 const gurka::relations relations3 = {{{gurka::relation_member{gurka::way_member, "kh", "from"},
                                        gurka::relation_member{gurka::way_member, "il", "to"},
@@ -146,37 +152,31 @@ void set_hierarchy_limits(vs::cost_ptr_t cost, bool bdir) {
 }
 void make_tile() {
 
-  if (filesystem::exists(test_dir))
-    filesystem::remove_all(test_dir);
+  if (std::filesystem::exists(test_dir))
+    std::filesystem::remove_all(test_dir);
 
-  filesystem::create_directories(test_dir);
+  std::filesystem::create_directories(test_dir);
 
   const double gridsize = 666;
 
   {
     // Build the maps from the ASCII diagrams, and extract the generated lon,lat values
     auto nodemap = gurka::detail::map_to_coordinates(map1, gridsize, {0, 0.2});
-    const int initial_osm_id = 0;
-    gurka::detail::build_pbf(nodemap, ways1, {}, {}, test_dir + "/map1.pbf", initial_osm_id);
+    gurka::detail::build_pbf(nodemap, ways1, nodes1, {}, test_dir + "/map1.pbf");
     for (const auto& n : nodemap)
       node_locations[n.first] = n.second;
   }
 
   {
     auto nodemap = gurka::detail::map_to_coordinates(map2, gridsize, {0.10, 0.2});
-    // Need to use a non-conflicting osm ID range for each map, as they
-    // all get merged during tile building, and we don't want a weirdly connected
-    // graph because IDs are shared
-    const int initial_osm_id = 100;
-    gurka::detail::build_pbf(nodemap, ways2, {}, {}, test_dir + "/map2.pbf", initial_osm_id);
+    gurka::detail::build_pbf(nodemap, ways2, nodes2, {}, test_dir + "/map2.pbf");
     for (const auto& n : nodemap)
       node_locations[n.first] = n.second;
   }
 
   {
     auto nodemap = gurka::detail::map_to_coordinates(map3, gridsize, {0.1, 0.1});
-    const int initial_osm_id = 200;
-    gurka::detail::build_pbf(nodemap, ways3, {}, relations3, test_dir + "/map3.pbf", initial_osm_id);
+    gurka::detail::build_pbf(nodemap, ways3, nodes3, relations3, test_dir + "/map3.pbf");
     for (const auto& n : nodemap)
       node_locations[n.first] = n.second;
   }
@@ -206,8 +206,9 @@ void make_tile() {
   ASSERT_EQ(tile->FileSuffix(tile_id), std::string("2/000/519/120.gph"))
       << "Tile ID didn't match the expected filename";
 
-  ASSERT_PRED1(filesystem::exists,
-               test_dir + filesystem::path::preferred_separator + tile->FileSuffix(tile_id))
+  std::filesystem::path tile_path{test_dir};
+  tile_path.append(tile->FileSuffix(tile_id));
+  ASSERT_TRUE(std::filesystem::exists(tile_path))
       << "Expected tile file didn't show up on disk - are the fixtures in the right location?";
 }
 
@@ -295,7 +296,9 @@ void assert_is_trivial_path(vt::PathAlgorithm& astar,
     case TrivialPathTest::MatchesEdge:
       // Grab time from an edge index
       const DirectedEdge* expected_edge = tile->directededge(assert_type_value);
-      auto expected_cost = mode_costing[int(mode)]->EdgeCost(expected_edge, tile);
+      auto edgeid = tile->header()->graphid();
+      edgeid.set_id(assert_type_value);
+      auto expected_cost = mode_costing[int(mode)]->EdgeCost(expected_edge, edgeid, tile);
       expected_time = expected_cost.secs;
       break;
   };
@@ -435,7 +438,7 @@ TEST(Astar, TestTrivialPathNoUturns) {
   actor.route(
       R"({"costing":"pedestrian","locations":[{"lon":5.114587,"lat":52.095957},{"lon":5.114506,"lat":52.096141}]})",
       {}, &api);
-  EXPECT_EQ(api.directions().routes(0).legs(0).summary().time(), 0);
+  EXPECT_NEAR(api.directions().routes(0).legs(0).summary().time(), 0, 0.001);
 }
 
 struct route_tester {
@@ -1467,15 +1470,15 @@ TEST(ComplexRestriction, WalkVias) {
 
   // Need to figure out if it's the forward or backward edge that we need to
   // use for walking
-  const auto cr = [&]() -> ComplexRestriction* {
+  const auto* cr = [&]() -> const ComplexRestriction* {
     const auto first_id = correlated.edges.front().id;
-    auto restrictions = tile->GetRestrictions(is_forward, first_id, costing->access_mode());
+    auto restrictions = tile->GetComplexRestrictions(is_forward, first_id, costing->access_mode());
     if (!restrictions.empty())
-      return restrictions.front();
+      return &restrictions.front();
     const auto second_id = correlated.edges.back().id;
-    restrictions = tile->GetRestrictions(is_forward, second_id, costing->access_mode());
+    restrictions = tile->GetComplexRestrictions(is_forward, second_id, costing->access_mode());
     if (!restrictions.empty())
-      return restrictions.front();
+      return &restrictions.front();
     return nullptr;
   }();
 
@@ -1546,7 +1549,7 @@ TEST(Astar, BiDirTrivial) {
   create_costing_options(options, Costing::auto_);
   vs::TravelMode mode;
   auto mode_costing = vs::CostFactory().CreateModeCosting(options, mode);
-  auto cost = mode_costing[int(mode)];
+  const auto& cost = mode_costing[int(mode)];
   set_hierarchy_limits(cost, true);
 
   // Loki

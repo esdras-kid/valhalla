@@ -1,16 +1,16 @@
 #ifndef __VALHALLA_THOR_MATRIXALGORITHM_H__
 #define __VALHALLA_THOR_MATRIXALGORITHM_H__
 
-#include <functional>
+#include <valhalla/baldr/graphid.h>
+#include <valhalla/baldr/graphreader.h>
+#include <valhalla/exceptions.h>
+#include <valhalla/proto/api.pb.h>
+#include <valhalla/proto/expansion.pb.h>
+#include <valhalla/sif/dynamiccost.h>
 
 #include <boost/property_tree/ptree.hpp>
 
-#include <valhalla/baldr/graphid.h>
-#include <valhalla/baldr/graphreader.h>
-#include <valhalla/proto/api.pb.h>
-// TODO(nils): should abstract more so we don't pull this in
-#include <valhalla/thor/pathalgorithm.h>
-#include <valhalla/worker.h>
+#include <functional>
 
 namespace valhalla {
 namespace thor {
@@ -129,7 +129,8 @@ public:
                                                   float,
                                                   uint32_t,
                                                   float,
-                                                  const Expansion_ExpansionType)>;
+                                                  const Expansion_ExpansionType,
+                                                  const uint8_t)>;
   void set_track_expansion(const expansion_callback_t& expansion_callback) {
     expansion_callback_ = expansion_callback;
   }
@@ -179,10 +180,10 @@ protected:
         // fill with sentinel values meaning "no data"
         matrix.mutable_begin_heading()->Resize(size, kInvalidHeading);
         matrix.mutable_end_heading()->Resize(size, kInvalidHeading);
-        matrix.mutable_begin_lat()->Resize(size, INVALID_LL);
-        matrix.mutable_begin_lon()->Resize(size, INVALID_LL);
-        matrix.mutable_end_lat()->Resize(size, INVALID_LL);
-        matrix.mutable_end_lon()->Resize(size, INVALID_LL);
+        matrix.mutable_begin_lat()->Resize(size, midgard::INVALID_LL);
+        matrix.mutable_begin_lon()->Resize(size, midgard::INVALID_LL);
+        matrix.mutable_end_lat()->Resize(size, midgard::INVALID_LL);
+        matrix.mutable_end_lon()->Resize(size, midgard::INVALID_LL);
       }
     }
   }

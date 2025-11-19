@@ -1,12 +1,4 @@
 #include "mjolnir/shortcutbuilder.h"
-#include "mjolnir/graphtilebuilder.h"
-
-#include <boost/format.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <string>
-#include <utility>
-#include <vector>
-
 #include "baldr/graphconstants.h"
 #include "baldr/graphid.h"
 #include "baldr/graphreader.h"
@@ -15,8 +7,19 @@
 #include "midgard/encoded.h"
 #include "midgard/logging.h"
 #include "midgard/pointll.h"
+#include "mjolnir/graphtilebuilder.h"
 #include "mjolnir/util.h"
+#include "scoped_timer.h"
 #include "sif/osrm_car_duration.h"
+
+#include <boost/property_tree/ptree.hpp>
+#ifdef LOGGING_LEVEL_DEBUG
+#include <boost/format.hpp>
+#endif
+
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace valhalla::midgard;
 using namespace valhalla::baldr;
@@ -161,9 +164,11 @@ GraphId GetOpposingEdge(const GraphId& node,
       return edgeid;
     }
   }
+#ifdef LOGGING_LEVEL_ERROR
   PointLL ll = nodeinfo->latlng(tile->header()->base_ll());
   LOG_ERROR("Opposing directed edge not found at LL= " + std::to_string(ll.lat()) + "," +
             std::to_string(ll.lng()));
+#endif
   return GraphId(0, 0, 0);
 }
 
@@ -300,14 +305,16 @@ bool CanContract(GraphReader& reader,
 void ConnectEdges(GraphReader& reader,
                   const GraphId& startnode,
                   const GraphId& edgeid,
-                  std::list<PointLL>& shape,
+                  std::vector<PointLL>& shape,
                   GraphId& endnode,
                   uint32_t& opp_local_idx,
                   uint32_t& restrictions,
                   float& average_density,
                   float& total_duration,
                   float& total_truck_duration,
-                  ShortcutAccessRestriction& access_restrictions) {
+                  ShortcutAccessRestriction& access_restrictions,
+                  bool& has_bridge,
+                  bool& has_tunnel) {
   // Get the tile and directed edge.
   auto tile = reader.GetGraphTile(startnode);
   const DirectedEdge* directededge = tile->directededge(edgeid);
@@ -342,8 +349,7 @@ void ConnectEdges(GraphReader& reader,
 
   // Append shape to the shortcut's shape. Skip first point since it
   // should equal the last of the prior edge.
-  edgeshape.pop_front();
-  shape.splice(shape.end(), edgeshape);
+  shape.insert(shape.end(), std::next(edgeshape.begin()), edgeshape.end());
 
   // Add to the weighted average
   average_density += directededge->length() * directededge->density();
@@ -353,6 +359,10 @@ void ConnectEdges(GraphReader& reader,
 
   // Update the end node
   endnode = directededge->endnode();
+
+  // Update has_bridge / has_tunnel flags
+  has_bridge |= directededge->bridge();
+  has_tunnel |= directededge->tunnel();
 }
 
 // Check if the edge is entering a contracted node
@@ -379,7 +389,8 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
   }
 
   // Check if this is the last edge in a shortcut (if the endnode cannot be contracted).
-  auto last_edge = [&reader](graph_tile_ptr tile, const GraphId& endnode, EdgePairs& edgepairs) {
+  auto last_edge = [&reader](const graph_tile_ptr& tile, const GraphId& endnode,
+                             EdgePairs& edgepairs) {
     return !CanContract(reader, tile, endnode, edgepairs);
   };
 
@@ -424,8 +435,8 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
       // forward - reverse the shape so the edge info stored is forward for
       // the first added edge info
       auto edgeinfo = tile->edgeinfo(directededge);
-      std::list<PointLL> shape =
-          valhalla::midgard::decode7<std::list<PointLL>>(edgeinfo.encoded_shape());
+      std::vector<PointLL> shape =
+          valhalla::midgard::decode7<std::vector<PointLL>>(edgeinfo.encoded_shape());
       if (!directededge->forward()) {
         std::reverse(shape.begin(), shape.end());
       }
@@ -441,6 +452,8 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
       // For turn duration calculation during contraction
       uint32_t opp_local_idx = directededge->opp_local_idx();
       GraphId next_edge_id = edge_id;
+      bool has_bridge = directededge->bridge();
+      bool has_tunnel = directededge->tunnel();
       while (true) {
         EdgePairs edgepairs;
         graph_tile_ptr tile = reader.GetGraphTile(end_node);
@@ -458,9 +471,8 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
           // Break out of loop. This case can happen when a shortcut edge
           // enters another shortcut edge (but is not drivable in reverse
           // direction from the node).
-          const DirectedEdge* de = tile->directededge(next_edge_id);
           LOG_ERROR("Edge not found in edge pairs. WayID = " +
-                    std::to_string(tile->edgeinfo(de).wayid()));
+                    std::to_string(tile->edgeinfo(tile->directededge(next_edge_id)).wayid()));
           break;
         }
 
@@ -469,7 +481,8 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
         // on the connected shortcut - need to set that so turn restrictions
         // off of shortcuts work properly
         ConnectEdges(reader, end_node, next_edge_id, shape, end_node, opp_local_idx, rst,
-                     average_density, total_duration, total_truck_duration, access_restrictions);
+                     average_density, total_duration, total_truck_duration, access_restrictions,
+                     has_bridge, has_tunnel);
         total_edge_count++;
       }
 
@@ -508,7 +521,8 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
         for (const auto& res : access_restrictions.all_restrictions) {
           tilebuilder.AddAccessRestriction(AccessRestriction(tilebuilder.directededges().size(),
                                                              res.second.type(), res.second.modes(),
-                                                             res.second.value()));
+                                                             res.second.value(),
+                                                             res.second.except_destination()));
         }
       }
 
@@ -568,6 +582,10 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
       // Make sure shortcut edge is not marked as internal edge
       newedge.set_internal(false);
 
+      // Set bridge / tunnel flags
+      newedge.set_bridge(has_bridge);
+      newedge.set_tunnel(has_tunnel);
+
       // Add new directed edge to tile builder
       tilebuilder.directededges().emplace_back(std::move(newedge));
       shortcut_count++;
@@ -575,6 +593,7 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
     }
   }
 
+#ifdef LOGGING_LEVEL_WARN
   // Log a warning (with the node lat,lon) if the max number of shortcuts from a node
   // is exceeded. This is not serious (see NOTE above) but good to know where it occurs.
   if (shortcut_count > kMaxShortcutsFromNode) {
@@ -582,6 +601,7 @@ std::pair<uint32_t, uint32_t> AddShortcutEdges(GraphReader& reader,
     LOG_WARN("Exceeding max shortcut edges from a node at LL = " + std::to_string(ll.lat()) + "," +
              std::to_string(ll.lng()));
   }
+#endif
   return {shortcut_count, total_edge_count};
 }
 
@@ -669,20 +689,14 @@ std::pair<uint32_t, uint32_t> FormShortcuts(GraphReader& reader, const TileLevel
           auto restrictions = tile->GetAccessRestrictions(edgeid.id(), kAllAccess);
           for (const auto& res : restrictions) {
             tilebuilder.AddAccessRestriction(AccessRestriction(tilebuilder.directededges().size(),
-                                                               res.type(), res.modes(), res.value()));
+                                                               res.type(), res.modes(), res.value(),
+                                                               res.except_destination()));
           }
         }
 
         // Copy lane connectivity
         if (directededge->laneconnectivity()) {
-          auto laneconnectivity = tile->GetLaneConnectivity(edgeid.id());
-          if (laneconnectivity.size() == 0) {
-            LOG_ERROR("Base edge should have lane connectivity, but none found");
-          }
-          for (auto& lc : laneconnectivity) {
-            lc.set_to(tilebuilder.directededges().size());
-          }
-          tilebuilder.AddLaneConnectivity(laneconnectivity);
+          tilebuilder.CopyLaneConnectivityFromTile(tile, edgeid.id());
         }
 
         // Names can be different in the forward and backward direction
@@ -759,6 +773,7 @@ void ShortcutBuilder::Build(const boost::property_tree::ptree& pt) {
   // across tile boundaries so that we are only messing with one tile
   // in one thread at a time
 
+  SCOPED_TIMER();
   // Get GraphReader
   GraphReader reader(pt.get_child("mjolnir"));
 

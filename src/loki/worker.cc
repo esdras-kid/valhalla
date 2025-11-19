@@ -1,26 +1,17 @@
+#include "loki/worker.h"
+#include "loki/polygon_search.h"
+#include "loki/search.h"
+#include "midgard/logging.h"
+
 #include <boost/property_tree/ptree.hpp>
+
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 
-#include "baldr/json.h"
-#include "baldr/rapidjson_utils.h"
-#include "midgard/logging.h"
-#include "sif/autocost.h"
-#include "sif/bicyclecost.h"
-#include "sif/motorcyclecost.h"
-#include "sif/motorscootercost.h"
-#include "sif/pedestriancost.h"
-#include "tyr/actor.h"
-
-#include "loki/polygon_search.h"
-#include "loki/search.h"
-#include "loki/worker.h"
-
 using namespace valhalla;
-using namespace valhalla::tyr;
 using namespace valhalla::midgard;
 using namespace valhalla::baldr;
 using namespace valhalla::sif;
@@ -228,7 +219,8 @@ loki_worker_t::loki_worker_t(const boost::property_tree::ptree& config,
         kv.first == "max_exclude_polygons_length" ||
         kv.first == "max_distance_disable_hierarchy_culling" || kv.first == "skadi" ||
         kv.first == "status" || kv.first == "allow_hard_exclusions" ||
-        kv.first == "hierarchy_limits") {
+        kv.first == "hierarchy_limits" || kv.first == "min_linear_cost_factor" ||
+        kv.first == "max_linear_cost_edges") {
       continue;
     }
     if (kv.first != "trace") {
@@ -435,7 +427,7 @@ loki_worker_t::work(const std::list<zmq::message_t>& job,
     LOG_WARN("400::" + std::string(e.what()) + " request_id=" + std::to_string(info.id));
     result = serialize_error(e, info, request);
   } catch (const std::exception& e) {
-    LOG_ERROR("400::" + std::string(e.what()) + " request_id=" + std::to_string(info.id));
+    LOG_ERROR("500::" + std::string(e.what()) + " request_id=" + std::to_string(info.id));
     result = serialize_error({199, std::string(e.what())}, info, request);
   }
 

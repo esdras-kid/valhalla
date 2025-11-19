@@ -1,21 +1,22 @@
-#include <filesystem>
-#include <gtest/gtest.h>
-#include <iomanip>
-#include <vector>
-
 #include "baldr/graphreader.h"
 #include "baldr/landmark.h"
 #include "gurka.h"
+#include "midgard/logging.h"
 #include "mjolnir/graphtilebuilder.h"
 #include "mjolnir/landmarks.h"
-#include "odin/enhancedtrippath.h"
+#include "mjolnir/util.h"
 #include "test/test.h"
 
 #include <boost/property_tree/ptree.hpp>
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <vector>
 
 using namespace valhalla;
 using namespace valhalla::baldr;
 using namespace valhalla::gurka;
+using namespace valhalla::midgard;
 using namespace valhalla::mjolnir;
 
 // config for the first three tests
@@ -65,7 +66,7 @@ void BuildPBF() {
   constexpr double gridsize = 100;
   landmark_map.nodes = gurka::detail::map_to_coordinates(ascii_map, gridsize, {-.01, 0});
 
-  detail::build_pbf(landmark_map.nodes, ways, nodes, {}, pbf_filename, 0, false);
+  detail::build_pbf(landmark_map.nodes, ways, nodes, {}, pbf_filename, false);
 }
 
 void BuildPBFAddLandmarksToTiles() {
@@ -122,7 +123,7 @@ void BuildPBFAddLandmarksToTiles() {
   constexpr double gridsize = 5;
   landmark_map_tile_test.nodes = gurka::detail::map_to_coordinates(ascii_map, gridsize, {0, 0});
 
-  detail::build_pbf(landmark_map_tile_test.nodes, ways, nodes, {}, pbf_filename_tile_test, 0, false);
+  detail::build_pbf(landmark_map_tile_test.nodes, ways, nodes, {}, pbf_filename_tile_test, false);
 }
 
 void CheckLandmarksInTiles(GraphReader& reader, const GraphId& graphid) {
@@ -370,7 +371,7 @@ TEST(LandmarkTest, TestTileStoreLandmarks) {
       Landmark landmark(value.second);
 
       // check data correctness
-      std::vector<PointLL> shape = ei.shape();
+      const std::vector<PointLL>& shape = ei.shape();
       auto point = shape[shape.size() / 2];
       check_landmark(landmark, point);
     }
@@ -384,7 +385,7 @@ TEST(LandmarkTest, TestTileStoreLandmarks) {
       Landmark landmark(v.substr(1));
 
       // check data correctness
-      std::vector<PointLL> shape = ei.shape();
+      const std::vector<PointLL>& shape = ei.shape();
       auto point = shape[shape.size() / 2];
       check_landmark(landmark, point);
     }
@@ -516,7 +517,7 @@ TEST(LandmarkTest, TestLandmarksInManeuvers) {
 
   valhalla::gurka::map map{};
   map.nodes = gurka::detail::map_to_coordinates(ascii_map, 10, {0, 0});
-  detail::build_pbf(map.nodes, ways, nodes, {}, pbf, 0, false);
+  detail::build_pbf(map.nodes, ways, nodes, {}, pbf, false);
 
   map.config =
       test::make_config(workdir, {{"mjolnir.landmarks_db", db_path}},
